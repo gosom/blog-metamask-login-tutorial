@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/go-chi/chi"
+	"github.com/go-chi/cors"
 )
 
 var (
@@ -188,6 +189,10 @@ func run() error {
 
 	// setup the endpoints
 	r := chi.NewRouter()
+
+	//  Just allow all for the reference implementation
+	r.Use(cors.AllowAll().Handler)
+
 	r.Post("/register", RegisterHandler(storage))
 	r.Get("/users/{address:^0x[a-fA-F0-9]{40}$}/nonce", UserNonceHandler(storage))
 	r.Post("/signin", SigninHandler())
