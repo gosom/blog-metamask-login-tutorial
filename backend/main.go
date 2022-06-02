@@ -10,12 +10,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/go-chi/chi"
 	"github.com/go-chi/cors"
+	"github.com/golang-jwt/jwt/v4"
 )
 
 var (
@@ -26,6 +28,33 @@ var (
 	ErrMissingSig     = errors.New("signature is missing")
 	ErrAuthError      = errors.New("authentication error")
 )
+
+type JwtHmacProvider struct {
+	hmacSecret []byte
+	issuer     string
+	duration   time.Duration
+}
+
+func NewJwtHmacProvider(hmacSecret string, issuer string, duration time.Duration) *JwtHmacProvider {
+	ans := JwtHmacProvider{
+		hmacSecret: []byte(hmacSecret),
+		issuer:     issuer,
+		duration:   duration,
+	}
+	return &ans
+}
+
+func (j *JwtHmacProvider) CreateStandard(subject string) (string, error) {
+	now := time.Now()
+	claims := jwt.StandardClaims{
+		Issuer:    j.issuer,
+		Subject:   subject,
+		IssuedAt:  now.Unix(),
+		ExpiresAt: now.Add(j.duration).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(j.hmacSecret)
+}
 
 type User struct {
 	Address string
@@ -167,7 +196,7 @@ func (s SigninPayload) Validate() error {
 	return nil
 }
 
-func SigninHandler(storage *MemStorage) http.HandlerFunc {
+func SigninHandler(storage *MemStorage, jwtProvider *JwtHmacProvider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var p SigninPayload
 		if err := bindReqBody(r, &p); err != nil {
@@ -179,7 +208,7 @@ func SigninHandler(storage *MemStorage) http.HandlerFunc {
 			return
 		}
 		address := strings.ToLower(p.Address)
-		_, err := Authenticate(storage, address, p.Nonce, p.Sig)
+		user, err := Authenticate(storage, address, p.Nonce, p.Sig)
 		switch err {
 		case nil:
 		case ErrAuthError:
@@ -189,8 +218,16 @@ func SigninHandler(storage *MemStorage) http.HandlerFunc {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		signedToken, err := jwtProvider.CreateStandard(user.Address)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		resp := struct {
-		}{}
+			AccessToken string `json:"access"`
+		}{
+			AccessToken: signedToken,
+		}
 		renderJson(r, w, http.StatusOK, resp)
 	}
 }
@@ -279,6 +316,11 @@ func renderJson(r *http.Request, w http.ResponseWriter, statusCode int, res inte
 func run() error {
 	// initialization of storage
 	storage := NewMemStorage()
+	jwtProvider := NewJwtHmacProvider(
+		"read something from env here maybe",
+		"awesome-metamask-login",
+		time.Minute*15,
+	)
 
 	// setup the endpoints
 	r := chi.NewRouter()
@@ -288,7 +330,7 @@ func run() error {
 
 	r.Post("/register", RegisterHandler(storage))
 	r.Get("/users/{address:^0x[a-fA-F0-9]{40}$}/nonce", UserNonceHandler(storage))
-	r.Post("/signin", SigninHandler(storage))
+	r.Post("/signin", SigninHandler(storage, jwtProvider))
 	r.Get("/welcome", WelcomeHandler())
 
 	// start the server on port 8001
