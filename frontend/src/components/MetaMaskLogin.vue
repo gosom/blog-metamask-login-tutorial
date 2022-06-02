@@ -13,13 +13,10 @@
   import { Buffer } from 'buffer'
   const ethereum = window.ethereum
   var account = null
-  var address = ethereum.selectedAddress
+  var address = null
   var token = null
 
-  console.log(token)
-
   async function login() {
-    console.log("EDW")
     if (address === null || account === null){
       const accounts = await ethereum.request({ method: 'eth_requestAccounts' })
       account = accounts[0]
@@ -32,6 +29,7 @@
         return
       }
       await login()
+      return
     }else if (status_code != 200) {
       return
     }
@@ -84,7 +82,8 @@
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({ 
         address: address, 
-        nonce: nonce
+        nonce: nonce,
+        sig: sig,
         })
     }
     const response = await fetch("http://localhost:8001/signin", reqOpts)
