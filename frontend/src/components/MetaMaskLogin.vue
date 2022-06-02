@@ -16,6 +16,8 @@
   var address = null
   var token = null
 
+  console.log(token)
+
   async function login() {
     if (address === null || account === null){
       const accounts = await ethereum.request({ method: 'eth_requestAccounts' })
