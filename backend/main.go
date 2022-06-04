@@ -1,21 +1,25 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math/big"
 	"net/http"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/go-chi/chi"
 	"github.com/go-chi/cors"
+	"github.com/golang-jwt/jwt/v4"
 )
 
 var (
@@ -26,6 +30,49 @@ var (
 	ErrMissingSig     = errors.New("signature is missing")
 	ErrAuthError      = errors.New("authentication error")
 )
+
+type JwtHmacProvider struct {
+	hmacSecret []byte
+	issuer     string
+	duration   time.Duration
+}
+
+func NewJwtHmacProvider(hmacSecret string, issuer string, duration time.Duration) *JwtHmacProvider {
+	ans := JwtHmacProvider{
+		hmacSecret: []byte(hmacSecret),
+		issuer:     issuer,
+		duration:   duration,
+	}
+	return &ans
+}
+
+func (j *JwtHmacProvider) CreateStandard(subject string) (string, error) {
+	now := time.Now()
+	claims := jwt.RegisteredClaims{
+		Issuer:    j.issuer,
+		Subject:   subject,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(j.duration)),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(j.hmacSecret)
+}
+
+func (j *JwtHmacProvider) Verify(tokenString string) (*jwt.RegisteredClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+		}
+		return j.hmacSecret, nil
+	})
+	if err != nil {
+		return nil, ErrAuthError
+	}
+	if claims, ok := token.Claims.(*jwt.RegisteredClaims); ok && token.Valid {
+		return claims, nil
+	}
+	return nil, ErrAuthError
+}
 
 type User struct {
 	Address string
@@ -167,7 +214,7 @@ func (s SigninPayload) Validate() error {
 	return nil
 }
 
-func SigninHandler(storage *MemStorage) http.HandlerFunc {
+func SigninHandler(storage *MemStorage, jwtProvider *JwtHmacProvider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var p SigninPayload
 		if err := bindReqBody(r, &p); err != nil {
@@ -179,7 +226,7 @@ func SigninHandler(storage *MemStorage) http.HandlerFunc {
 			return
 		}
 		address := strings.ToLower(p.Address)
-		_, err := Authenticate(storage, address, p.Nonce, p.Sig)
+		user, err := Authenticate(storage, address, p.Nonce, p.Sig)
 		switch err {
 		case nil:
 		case ErrAuthError:
@@ -189,18 +236,77 @@ func SigninHandler(storage *MemStorage) http.HandlerFunc {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		signedToken, err := jwtProvider.CreateStandard(user.Address)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		resp := struct {
-		}{}
+			AccessToken string `json:"access"`
+		}{
+			AccessToken: signedToken,
+		}
 		renderJson(r, w, http.StatusOK, resp)
 	}
 }
 
 func WelcomeHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		user := getUserFromReqContext(r)
+		resp := struct {
+			Msg string `json:"msg"`
+		}{
+			Msg: "Congrats " + user.Address + " you made it",
+		}
+		renderJson(r, w, http.StatusOK, resp)
 	}
 }
 
 // ============================================================================
+
+func getUserFromReqContext(r *http.Request) User {
+	ctx := r.Context()
+	key := ctx.Value("user").(User)
+	return key
+}
+
+func AuthMiddleware(storage *MemStorage, jwtProvider *JwtHmacProvider) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headerValue := r.Header.Get("Authorization")
+			const prefix = "Bearer "
+			if len(headerValue) < len(prefix) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			tokenString := headerValue[len(prefix):]
+			if len(tokenString) == 0 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+
+			claims, err := jwtProvider.Verify(tokenString)
+			if err != nil {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+
+			user, err := storage.Get(claims.Subject)
+			if err != nil {
+				if errors.Is(err, ErrUserNotExists) {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), "user", user)
+			next.ServeHTTP(w, r.WithContext(ctx))
+
+		})
+	}
+}
 
 func Authenticate(storage *MemStorage, address string, nonce string, sigHex string) (User, error) {
 	user, err := storage.Get(address)
@@ -279,6 +385,11 @@ func renderJson(r *http.Request, w http.ResponseWriter, statusCode int, res inte
 func run() error {
 	// initialization of storage
 	storage := NewMemStorage()
+	jwtProvider := NewJwtHmacProvider(
+		"read something from env here maybe",
+		"awesome-metamask-login",
+		time.Minute*15,
+	)
 
 	// setup the endpoints
 	r := chi.NewRouter()
@@ -288,8 +399,12 @@ func run() error {
 
 	r.Post("/register", RegisterHandler(storage))
 	r.Get("/users/{address:^0x[a-fA-F0-9]{40}$}/nonce", UserNonceHandler(storage))
-	r.Post("/signin", SigninHandler(storage))
-	r.Get("/welcome", WelcomeHandler())
+	r.Post("/signin", SigninHandler(storage, jwtProvider))
+
+	r.Group(func(r chi.Router) {
+		r.Use(AuthMiddleware(storage, jwtProvider))
+		r.Get("/welcome", WelcomeHandler())
+	})
 
 	// start the server on port 8001
 	err := http.ListenAndServe("localhost:8001", r)
