@@ -1,22 +1,29 @@
 <template >
-  <button @click="login">
+  <button v-if="!loggedIn" @click="login">
     <img src="../assets/metamask-logo.svg"  
     width="60" height="60"
     @click="login"
     />
     <span>Login with Metamask</span>
   </button>
+  <div v-else>
+    <div>jwt token: {{ token }} </div>
+    <button @click="get_welcome">click to get welcome</button>
+    <div>{{ (welcome != null) ? welcome.msg : "" }}</div>
+  </div>
 </template>
 
 
 <script setup>
   import { Buffer } from 'buffer'
+  import { ref} from 'vue'
   const ethereum = window.ethereum
-  var account = null
-  var address = null
-  var token = null
+  let account = null
+  let address = null
+  let token = ref(null)
+  let welcome = ref(null)
+  let loggedIn = ref(false)
 
-  console.log(token)
 
   async function login() {
     if (address === null || account === null){
@@ -37,7 +44,23 @@
     }
 
     const signature = await sign(nonce)
-    token = await perform_signin(signature, nonce)
+    const data = await perform_signin(signature, nonce)
+    token.value = data.access
+    loggedIn.value = true
+  }
+
+  async function get_welcome() {
+    const reqOpts = {
+      method: "GET",
+      headers: {"Content-Type": "application/json",
+                "Authorization": "Bearer " + token.value},
+    }
+    const response = await fetch("http://localhost:8001/welcome", reqOpts)
+    if (response.status === 200) {
+      welcome.value = await response.json()
+    }else {
+      console.log(response.status)
+    }
   }
 
   async function get_nonce() {
